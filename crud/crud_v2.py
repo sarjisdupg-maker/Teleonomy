@@ -20,7 +20,7 @@ except ImportError:
 from schema_align.core import DataAligner
 from schema_align.config import AlignmentConfig
 from .logger import log_call, log_json
-from .where_build import build_update
+from .crud_build import build_update
 
 
 DataItem = Mapping[str, Any]

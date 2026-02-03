@@ -73,6 +73,7 @@ class SchemaManager:
 
     def validate_upsert_constraints(self, table: str, key_cols: List[str], schema: str=None) -> None:
         if self.db_type not in ('postgres', 'mysql', 'sqlite'): return
+        self.refresh()
         pk_cols = set(self._inspector.get_pk_constraint(table, schema=schema).get('constrained_columns', []))
         unique_cons = [set(uc.get('column_names', [])) for uc in self._inspector.get_unique_constraints(table, schema=schema)]
         if not (set(key_cols) <= pk_cols or any(set(key_cols) <= uc for uc in unique_cons)):

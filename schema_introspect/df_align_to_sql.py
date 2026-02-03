@@ -292,12 +292,13 @@ def align_dataframe_to_schema(
     engine: Engine,
     table: str,
     schema: Optional[str] = None,
-    threshold: float = 10.0,
+    threshold: float = 5.0,
     fix_outliers: bool = False,
     auto_alter: bool = False,
     outlier_method: str = 'iqr',
     iqr_scale: float = 1.5,
-    z_threshold: float = 3.0
+    z_threshold: float = 3.0,
+    strict_mode: bool = True  # NEW safe-by-default gate
 ) -> Tuple[pd.DataFrame, Dict[str, any]]:
     """
     Align DF to schema, optional auto-alter & outlier fix.
@@ -399,6 +400,9 @@ def align_dataframe_to_schema(
     # Final DF with correct order
     ordered_cols = _table_column_order(table_obj)
     final_df = pd.DataFrame({c: aligned.get(c, pd.Series(pd.NA, index=df.index)) for c in ordered_cols})
+
+    if strict_mode and report['columns_failed']:
+        raise ValueError(f"Null introduction exceeded threshold for columns: {report['columns_failed']}")
     
     return final_df, report
 

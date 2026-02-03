@@ -155,9 +155,9 @@ class SchemaAligner:
     DEFAULT_FALSE = {"0", "false", "no", "n", "off"}
 
     def __init__(self, conn: Connection | Engine, db_type: str | None = None,
-                 *, on_error: str = 'coerce', failure_threshold: float = 3,
+                 *, on_error: str = 'coerce', failure_threshold: float = 0.02,
                  validate_fk: bool = False, add_missing_cols: bool = False,
-                 col_map: Dict[str, str] | None = None):
+                 col_map: Dict[str, str] | None = None, strict_mode: bool = True):
         """Initialize SchemaAligner with a persistent connection and defaults."""
         if conn is None:
             raise ValueError("Connection/engine is required")
@@ -171,6 +171,7 @@ class SchemaAligner:
         self._default_validate_fk = validate_fk
         self._default_add_missing_cols = add_missing_cols
         self._default_col_map = dict(col_map) if col_map else None
+        self._strict_mode = strict_mode  # NEW safe-by-default flag
     
     def _detect_dialect(self, conn: Connection | Engine) -> str:
         """Extract dialect name from SQLAlchemy engine/connection."""
@@ -185,6 +186,14 @@ class SchemaAligner:
         if dialect_name in ('mariadb',):
             return 'mysql'
         return dialect_name
+    
+    def _normalize_threshold(self, value: float | None) -> float:
+        t = self._default_failure_threshold if value is None else value
+        if t > 1:
+            t = t / 100.0
+        if t < 0:
+            t = 0.0
+        return t
     
     @property
     def db_type(self) -> str:
@@ -210,7 +219,9 @@ class SchemaAligner:
         if actual_conn is None:
             raise ValueError("Connection/engine is required")
         on_error = on_error if on_error is not None else self._default_on_error
-        failure_threshold = failure_threshold if failure_threshold is not None else self._default_failure_threshold
+        if self._strict_mode and on_error == 'coerce':
+            on_error = 'raise'  # NEW enforce fail-fast when strict
+        failure_threshold = self._normalize_threshold(failure_threshold)
         validate_fk = validate_fk if validate_fk is not None else self._default_validate_fk
         add_missing_cols = add_missing_cols if add_missing_cols is not None else self._default_add_missing_cols
         if col_map is not None:
@@ -402,51 +413,41 @@ class SchemaAligner:
         safe_table = _safe_ident(table)
         safe_schema = _safe_ident(schema) if schema else None
         full_table = f"{safe_schema}.{safe_table}" if safe_schema else safe_table
-        # Function to execute SQL
-        def run_sql(sql):
-            if isinstance(conn, Engine):
-                with conn.begin() as c:
-                    c.execute(text(sql))
-            else:
-                conn.execute(text(sql))
-        
-        for col in new_cols:
-            try:
-                sql_type = map_type(df[col])
-                # Validate and quote column name
-                safe_col_name = _safe_ident(col)
-                if self.db_type in ('mysql', 'mariadb'):
-                    quoted_col = f'`{safe_col_name}`'
-                elif self.db_type == 'mssql':
-                    quoted_col = f'[{safe_col_name}]'
-                else:
-                    quoted_col = f'"{safe_col_name}"'
-
-                alter_stmt = f"ALTER TABLE {full_table} ADD COLUMN {quoted_col} {sql_type}"
-
-                # Dialect adjustments
-                if self.db_type == 'mssql':
-                    alter_stmt = f"ALTER TABLE {full_table} ADD {quoted_col} {sql_type}"
-                elif self.db_type == 'oracle':
-                    alter_stmt = f"ALTER TABLE {full_table} ADD {quoted_col} {sql_type}"
-                elif self.db_type == 'sqlite':
-                    # SQLite supports ADD COLUMN
-                    pass
-                    
-                logger.info(f"Executing: {alter_stmt}")
-                run_sql(alter_stmt)
+        exec_ctx = conn.begin() if not isinstance(conn, Engine) else conn.begin()
+        with exec_ctx as c:
+            for col in new_cols:
                 try:
-                    log_string(f"schema_evolution_{table}", f"Added column: {col} ({sql_type})")
-                except Exception:
-                    pass
-            except (ValueError, KeyError, SQLAlchemyError) as e:
-                # Restrict to expected error classes to avoid masking unrelated bugs
-                logger.error(f"Failed to add column '{col}': {e}")
-                try:
-                    log_json(f"schema_evolution_error_{table}", {"column": col, "error": str(e), "sql_type": sql_type})
-                except Exception:
-                    pass
-                # Continue attempting remaining columns
+                    sql_type = map_type(df[col])
+                    safe_col_name = _safe_ident(col)
+                    if self.db_type in ('mysql', 'mariadb'):
+                        quoted_col = f'`{safe_col_name}`'
+                    elif self.db_type == 'mssql':
+                        quoted_col = f'[{safe_col_name}]'
+                    else:
+                        quoted_col = f'"{safe_col_name}"'
+
+                    alter_stmt = f"ALTER TABLE {full_table} ADD COLUMN {quoted_col} {sql_type}"
+
+                    if self.db_type == 'mssql':
+                        alter_stmt = f"ALTER TABLE {full_table} ADD {quoted_col} {sql_type}"
+                    elif self.db_type == 'oracle':
+                        alter_stmt = f"ALTER TABLE {full_table} ADD {quoted_col} {sql_type}"
+                    elif self.db_type == 'sqlite':
+                        pass
+                        
+                    logger.info(f"Executing: {alter_stmt}")
+                    c.execute(text(alter_stmt))
+                    try:
+                        log_string(f"schema_evolution_{table}", f"Added column: {col} ({sql_type})")
+                    except Exception:
+                        pass
+                except (ValueError, KeyError, SQLAlchemyError) as e:
+                    logger.error(f"Failed to add column '{col}': {e}")
+                    try:
+                        log_json(f"schema_evolution_error_{table}", {"column": col, "error": str(e), "sql_type": sql_type})
+                    except Exception:
+                        pass
+                    raise
 
     # -------------------------------------------------------------------------
     # Mapping - Key Normalization
@@ -587,7 +588,6 @@ class SchemaAligner:
         except Exception:
             pass
 
-        # Attempt Outlier Correction
         if SKLEARN_AVAILABLE and original_series is not None and pd.api.types.is_numeric_dtype(original_series):
              logger.info(f"[{col_name}] Failure rate {rate:.1%} exceeds threshold. Attempting Outlier Detection.")
              is_outlier = self._detect_outliers(original_series)
@@ -601,18 +601,11 @@ class SchemaAligner:
              if sys_rate <= threshold:
                  logger.warning(f"[{col_name}] Systematic failures {sys_rate:.1%} <= threshold (outliers removed). Coercing to NULL.")
                  return
-             
-             # If still over threshold, use sys_rate for error message
-             # Note: caller uses original mask, so this is just for validation logic.
-             # Strict corrector will nullify failures later if we return? 
-             # No, this function returns void. The caller (e.g. _strict_int) sets NaNs if we return.
-             # If we raise, process aborts.
              rate = sys_rate
              fail_count = sys_count
 
         err_msg = f"[{col_name}] Critical: {fail_count}/{total} ({rate:.1%}) rows failed {msg}."
         
-        # Audit Fix: Respect on_error='coerce' even if threshold exceeded
         if on_error == 'coerce':
              logger.error(f"{err_msg} Exceeds threshold {threshold:.1%} but on_error='coerce'. Coercing to NULL.")
              return
@@ -665,6 +658,8 @@ class SchemaAligner:
         if info.length:
             out_of_bounds = s_str.str.len() > info.length
             if out_of_bounds.any():
+                 if self._strict_mode:
+                     raise ValueError(f"[{info.name}] length overflow: {int(out_of_bounds.sum())} rows exceed {info.length}")
                  self._validate_failure_rate(out_of_bounds, info.name, on_error, threshold, f"max length {info.length}", original_series=s_str.str.len())
                  s_str.loc[out_of_bounds] = None
         return s_str
@@ -710,9 +705,8 @@ class SchemaAligner:
                 # Assign back and coerce to pandas datetime
                 s_dt.loc[mask_try] = pd.to_datetime(parsed, errors='coerce')
         
-        # For databases that need timezone awareness, localize naive datetimes to UTC
-        if self.db_type not in ('sqlite', 'mysql'):
-            # Only localize if dtype is naive datetime64 (not timezone-aware)
+        target_tz = getattr(getattr(info, 'raw_type', None), 'timezone', False)
+        if target_tz:
             try:
                 from pandas.api.types import is_datetime64tz_dtype
                 if not is_datetime64tz_dtype(s_dt.dtype):
@@ -754,16 +748,18 @@ class SchemaAligner:
                 if df.duplicated(subset=pk_cols_present).any():
                     dupes = df[df.duplicated(subset=pk_cols_present, keep=False)]
                     logger.error(f"Primary Key violation: Duplicates found in {pk_cols_present}. count={len(dupes)}")
+                    if self._strict_mode:
+                        raise ValueError(f"Primary Key violation in batch for {pk_cols_present}")
 
-        # 2. Unique Constraints
         for u in constraints.unique_constraints:
             u_cols = u.get('column_names', [])
             u_cols_present = [c for c in u_cols if c in df.columns]
             if u_cols_present and len(u_cols_present) == len(u_cols):
                 if df.duplicated(subset=u_cols_present).any():
                      logger.error(f"Unique constraint violation: Duplicates in {u_cols_present}.")
+                     if self._strict_mode:
+                         raise ValueError(f"Unique constraint violation in batch for {u_cols_present}")
 
-        # 3. Foreign Keys (DB Check)
         if validate_fk:
              pass
 
